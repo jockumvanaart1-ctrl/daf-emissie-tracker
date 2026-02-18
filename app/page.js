@@ -1,5 +1,6 @@
 "use client";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
+import { supabase } from "./supabase";
 
 const UPLIFT = 1.08;
 const EF_FLIGHT = {
@@ -7,7 +8,7 @@ const EF_FLIGHT = {
   long: { economy: 0.14787, premium: 0.23659, business: 0.42882, first: 0.59235 },
 };
 const EF_TRAIN = 0.00371;
-const HAUL_THRESHOLD = 3700;
+const HAUL = 3700;
 
 const REGIONS = [
   { key: "africa", label: "Afrika — Posten", color: "#0f766e", data: [
@@ -130,63 +131,32 @@ const REGIONS = [
 ];
 
 const ALL = [];
-let offset = 0;
-const REGION_OFFSETS = {};
-REGIONS.forEach((r) => {
-  REGION_OFFSETS[r.key] = offset;
-  r.data.forEach((d, i) => ALL.push({ ...d, region: r.key, gIdx: offset + i }));
-  offset += r.data.length;
-});
+let off = 0;
+const RO = {};
+REGIONS.forEach((r) => { RO[r.key] = off; r.data.forEach((d) => ALL.push({ ...d, region: r.key })); off += r.data.length; });
 
 const AMS = { lat: 52.31, lon: 4.76 };
-
 function hav(a, b) {
-  const R = 6371,
-    dLat = ((b.lat - a.lat) * Math.PI) / 180,
-    dLon = ((b.lon - a.lon) * Math.PI) / 180;
-  const x =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((a.lat * Math.PI) / 180) *
-      Math.cos((b.lat * Math.PI) / 180) *
-      Math.sin(dLon / 2) ** 2;
+  const R = 6371, dLat = ((b.lat - a.lat) * Math.PI) / 180, dLon = ((b.lon - a.lon) * Math.PI) / 180;
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos((a.lat * Math.PI) / 180) * Math.cos((b.lat * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
-
-function getLegCO2Flight(gcKm, cls) {
-  const d = gcKm * UPLIFT;
-  const band = gcKm >= HAUL_THRESHOLD ? "long" : "short";
-  return (d * (EF_FLIGHT[band][cls] || EF_FLIGHT[band].economy)) / 1000;
-}
-function getLegCO2Train(gcKm) {
-  return (gcKm * 1.2 * EF_TRAIN) / 1000;
-}
-
-function getP(idx) {
-  return { lat: ALL[idx].lat, lon: ALL[idx].lon };
-}
-function getN(idx) {
-  return ALL[idx].city;
-}
-function getR(idx) {
-  const r = REGIONS.find((r) => r.key === ALL[idx].region);
-  return r ? r.label.split(" —")[0] : "";
-}
+function fCO2(gc, c) { const d = gc * UPLIFT; const b = gc >= HAUL ? "long" : "short"; return (d * (EF_FLIGHT[b][c] || EF_FLIGHT[b].economy)) / 1000; }
+function tCO2(gc) { return (gc * 1.2 * EF_TRAIN) / 1000; }
+function getP(i) { return { lat: ALL[i].lat, lon: ALL[i].lon }; }
+function getN(i) { return ALL[i].city; }
+function getR(i) { const r = REGIONS.find((r) => r.key === ALL[i].region); return r ? r.label.split(" —")[0] : ""; }
 
 function calcRoute(stops, mode, cls) {
   if (!stops.length) return { legs: [], totalKm: 0, totalCO2: 0 };
-  const pts = [AMS, ...stops.map(getP), AMS];
-  const nms = ["AMS", ...stops.map(getN), "AMS"];
-  const legs = [];
-  let totalKm = 0,
-    totalCO2 = 0;
+  const pts = [AMS, ...stops.map(getP), AMS], nms = ["AMS", ...stops.map(getN), "AMS"];
+  const legs = []; let tk = 0, tc = 0;
   for (let i = 0; i < pts.length - 1; i++) {
     const gc = hav(pts[i], pts[i + 1]);
-    const co2 = mode === "train" ? getLegCO2Train(gc) : getLegCO2Flight(gc, cls);
-    legs.push({ from: nms[i], to: nms[i + 1], gc: Math.round(gc), co2 });
-    totalKm += gc;
-    totalCO2 += co2;
+    const co2 = mode === "train" ? tCO2(gc) : fCO2(gc, cls);
+    legs.push({ from: nms[i], to: nms[i + 1], gc: Math.round(gc), co2 }); tk += gc; tc += co2;
   }
-  return { legs, totalKm, totalCO2 };
+  return { legs, totalKm: tk, totalCO2: tc };
 }
 
 export default function Home() {
@@ -195,6 +165,8 @@ export default function Home() {
   const [reductionPct, setReductionPct] = useState(15);
   const currentYear = 2026;
   const [trips, setTrips] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
   const [traveler, setTraveler] = useState("");
   const [mode, setMode] = useState("flight");
   const [cls, setCls] = useState("economy");
@@ -204,38 +176,60 @@ export default function Home() {
   const [editIdx, setEditIdx] = useState(null);
   const [regionFilter, setRegionFilter] = useState("all");
 
-  const toggle = (i) =>
-    setStops((p) => (p.includes(i) ? p.filter((x) => x !== i) : [...p, i]));
-  const mv = (i, d) =>
-    setStops((p) => {
-      const a = [...p],
-        n = i + d;
-      if (n < 0 || n >= a.length) return a;
-      [a[i], a[n]] = [a[n], a[i]];
-      return a;
-    });
-  const rm = (i) => setStops((p) => p.filter((_, j) => j !== i));
+  // Laad reizen uit Supabase
+  const loadTrips = useCallback(async () => {
+    setLoading(true);
+    const { data, error } = await supabase
+      .from("trips")
+      .select("*")
+      .order("start_date", { ascending: true });
+    if (!error && data) {
+      setTrips(data.map((r) => ({
+        id: r.id, traveler: r.traveler, mode: r.mode, class: r.class,
+        startDate: r.start_date, endDate: r.end_date, route: r.route,
+        stops: r.stops, km: Number(r.km), co2: Number(r.co2),
+      })));
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { loadTrips(); }, [loadTrips]);
+
+  const toggle = (i) => setStops((p) => (p.includes(i) ? p.filter((x) => x !== i) : [...p, i]));
+  const mv = (i, d) => setStops((p) => { const a = [...p], n = i + d; if (n < 0 || n >= a.length) return a; [a[i], a[n]] = [a[n], a[i]]; return a; });
+  const rmStop = (i) => setStops((p) => p.filter((_, j) => j !== i));
 
   const route = useMemo(() => calcRoute(stops, mode, cls), [stops, mode, cls]);
-  const label =
-    stops.length > 0
-      ? ["AMS", ...stops.map(getN), "AMS"].join(" → ")
-      : "Selecteer bestemmingen hieronder";
+  const label = stops.length > 0 ? ["AMS", ...stops.map(getN), "AMS"].join(" → ") : "Selecteer bestemmingen hieronder";
 
-  const add = () => {
+  const add = async () => {
     if (!traveler.trim() || !startDate || !stops.length) return;
-    const t = {
-      traveler: traveler.trim(), stops: [...stops], route: label,
-      km: route.totalKm, class: cls, co2: route.totalCO2,
-      startDate, endDate: endDate || startDate, legs: route.legs, mode,
+    setSaving(true);
+    const row = {
+      traveler: traveler.trim(), mode, class: cls,
+      start_date: startDate, end_date: endDate || startDate,
+      route: label, stops: [...stops],
+      km: route.totalKm, co2: route.totalCO2,
     };
+
     if (editIdx !== null) {
-      setTrips((p) => p.map((x, i) => (i === editIdx ? t : x)));
+      const tripId = trips[editIdx].id;
+      await supabase.from("trips").update(row).eq("id", tripId);
       setEditIdx(null);
-    } else setTrips((p) => [...p, t]);
+    } else {
+      await supabase.from("trips").insert(row);
+    }
     setTraveler(""); setStartDate(""); setEndDate(""); setStops([]);
+    await loadTrips();
+    setSaving(false);
   };
-  const del = (i) => setTrips((p) => p.filter((_, j) => j !== i));
+
+  const del = async (i) => {
+    const tripId = trips[i].id;
+    await supabase.from("trips").delete().eq("id", tripId);
+    await loadTrips();
+  };
+
   const edit = (i) => {
     const t = trips[i];
     setTraveler(t.traveler); setStartDate(t.startDate); setEndDate(t.endDate);
@@ -247,25 +241,22 @@ export default function Home() {
   const pctOfTarget = target > 0 ? (totalCO2 / target) * 100 : 0;
   const pctOfBaseline = baseline > 0 ? (totalCO2 / baseline) * 100 : 0;
   const warningPct = 100 - reductionPct;
-  const actualReduction =
-    baseline > 0 ? ((baseline - totalCO2) / baseline) * 100 : 0;
+  const actualReduction = baseline > 0 ? ((baseline - totalCO2) / baseline) * 100 : 0;
 
-  const byTraveler = useMemo(() => {
-    const m = {};
-    trips.forEach((t) => { m[t.traveler] = (m[t.traveler] || 0) + t.co2; });
-    return Object.entries(m).sort((a, b) => b[1] - a[1]);
-  }, [trips]);
-  const byDest = useMemo(() => {
-    const m = {};
-    trips.forEach((t) => t.stops.forEach((s) => { m[getN(s)] = (m[getN(s)] || 0) + 1; }));
-    return Object.entries(m).sort((a, b) => b[1] - a[1]);
-  }, [trips]);
+  const byTraveler = useMemo(() => { const m = {}; trips.forEach((t) => { m[t.traveler] = (m[t.traveler] || 0) + t.co2; }); return Object.entries(m).sort((a, b) => b[1] - a[1]); }, [trips]);
+  const byDest = useMemo(() => { const m = {}; trips.forEach((t) => t.stops.forEach((s) => { m[getN(s)] = (m[getN(s)] || 0) + 1; })); return Object.entries(m).sort((a, b) => b[1] - a[1]); }, [trips]);
 
   const st = {
     inp: { padding: "8px 10px", border: "1px solid #cbd5e1", borderRadius: 8, fontSize: 14, boxSizing: "border-box", width: "100%" },
     lbl: { display: "block", fontSize: 12, fontWeight: 600, marginBottom: 4, color: "#64748b" },
     card: { background: "#fff", border: "1px solid #e2e8f0", borderRadius: 12, padding: 20, marginBottom: 20 },
   };
+
+  if (loading) return (
+    <div style={{ maxWidth: 920, margin: "0 auto", padding: 20, textAlign: "center", paddingTop: 100 }}>
+      <div style={{ fontSize: 18, fontWeight: 600, color: "#154273" }}>DAF Emissie Tracker laden...</div>
+    </div>
+  );
 
   return (
     <div style={{ maxWidth: 920, margin: "0 auto", padding: 20 }}>
@@ -289,16 +280,12 @@ export default function Home() {
             <input type="number" value={reductionPct} onChange={(e) => setReductionPct(+e.target.value)} min={0} max={100} style={{ width: 80, padding: "6px 10px", border: "1px solid #cbd5e1", borderRadius: 8, fontSize: 14 }} />
           </div>
           <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 8, padding: "8px 14px", fontSize: 13 }}>
-            <span style={{ color: "#64748b" }}>Doel {currentYear}: </span>
-            <strong>{target.toFixed(1)} t CO₂e</strong>
-            <span style={{ color: "#64748b" }}> ({reductionPct}% minder dan {baseYear})</span>
+            <span style={{ color: "#64748b" }}>Doel {currentYear}: </span><strong>{target.toFixed(1)} t CO₂e</strong><span style={{ color: "#64748b" }}> ({reductionPct}% minder dan {baseYear})</span>
           </div>
         </div>
-
         <div style={{ marginBottom: 16 }}>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6, fontWeight: 600 }}>
-            <span>Huidig {currentYear}: {totalCO2.toFixed(1)} t CO₂e</span>
-            <span>Doel {currentYear}: {target.toFixed(1)} t CO₂e</span>
+            <span>Huidig {currentYear}: {totalCO2.toFixed(1)} t CO₂e</span><span>Doel {currentYear}: {target.toFixed(1)} t CO₂e</span>
           </div>
           <div style={{ position: "relative", marginBottom: 6 }}>
             <div style={{ background: "#e2e8f0", borderRadius: 999, height: 32, overflow: "hidden", position: "relative" }}>
@@ -309,44 +296,25 @@ export default function Home() {
               <span style={{ position: "absolute", left: "50%", top: "50%", transform: "translate(-50%,-50%)", fontWeight: 700, fontSize: 13, color: pctOfTarget > 40 ? "#fff" : "#334155", zIndex: 3, textShadow: pctOfTarget > 40 ? "0 1px 2px rgba(0,0,0,0.2)" : "none" }}>{pctOfTarget.toFixed(1)}% gebruikt</span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#94a3b8", marginTop: 4, position: "relative" }}>
-              <span>0%</span>
-              <span style={{ position: "absolute", left: `${warningPct}%`, transform: "translateX(-50%)", color: "#dc2626", fontWeight: 700 }}>⚑ {warningPct}%</span>
-              <span>100%</span>
+              <span>0%</span><span style={{ position: "absolute", left: `${warningPct}%`, transform: "translateX(-50%)", color: "#dc2626", fontWeight: 700 }}>⚑ {warningPct}%</span><span>100%</span>
             </div>
           </div>
-          {pctOfTarget > 100
-            ? <p style={{ color: "#ef4444", fontWeight: 600, fontSize: 13, margin: 0 }}>Doel {currentYear} overschreden met {(totalCO2 - target).toFixed(1)} ton!</p>
-            : pctOfTarget > warningPct
-              ? <p style={{ color: "#ef4444", fontWeight: 600, fontSize: 13, margin: 0 }}>Voorbij {warningPct}% — nog maar {(target - totalCO2).toFixed(1)} ton over!</p>
-              : <p style={{ color: "#10b981", fontWeight: 600, fontSize: 13, margin: 0 }}>Nog {(target - totalCO2).toFixed(1)} ton beschikbaar binnen het doel</p>}
+          {pctOfTarget > 100 ? <p style={{ color: "#ef4444", fontWeight: 600, fontSize: 13, margin: 0 }}>Doel {currentYear} overschreden met {(totalCO2 - target).toFixed(1)} ton!</p>
+            : pctOfTarget > warningPct ? <p style={{ color: "#ef4444", fontWeight: 600, fontSize: 13, margin: 0 }}>Voorbij {warningPct}% — nog maar {(target - totalCO2).toFixed(1)} ton over!</p>
+            : <p style={{ color: "#10b981", fontWeight: 600, fontSize: 13, margin: 0 }}>Nog {(target - totalCO2).toFixed(1)} ton beschikbaar binnen het doel</p>}
         </div>
-
         <div style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 10, padding: 16 }}>
           <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10 }}>Reductie t.o.v. {baseYear}</div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, fontSize: 13 }}>
-            <div style={{ textAlign: "center", padding: 10, background: "#f8fafc", borderRadius: 8 }}>
-              <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>{baseYear} Basis</div>
-              <div style={{ fontSize: 20, fontWeight: 700 }}>{baseline.toFixed(1)}</div>
-              <div style={{ fontSize: 11, color: "#64748b" }}>t CO₂e</div>
-            </div>
-            <div style={{ textAlign: "center", padding: 10, background: "#f8fafc", borderRadius: 8 }}>
-              <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Huidig {currentYear}</div>
-              <div style={{ fontSize: 20, fontWeight: 700, color: totalCO2 <= target ? "#10b981" : "#ef4444" }}>{totalCO2.toFixed(1)}</div>
-              <div style={{ fontSize: 11, color: "#64748b" }}>t CO₂e</div>
-            </div>
-            <div style={{ textAlign: "center", padding: 10, background: "#f8fafc", borderRadius: 8 }}>
-              <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Gebruikt van {baseYear}</div>
-              <div style={{ fontSize: 20, fontWeight: 700 }}>{pctOfBaseline.toFixed(1)}%</div>
-              <div style={{ fontSize: 11, color: "#64748b" }}>van basis</div>
-            </div>
+            <div style={{ textAlign: "center", padding: 10, background: "#f8fafc", borderRadius: 8 }}><div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>{baseYear} Basis</div><div style={{ fontSize: 20, fontWeight: 700 }}>{baseline.toFixed(1)}</div><div style={{ fontSize: 11, color: "#64748b" }}>t CO₂e</div></div>
+            <div style={{ textAlign: "center", padding: 10, background: "#f8fafc", borderRadius: 8 }}><div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Huidig {currentYear}</div><div style={{ fontSize: 20, fontWeight: 700, color: totalCO2 <= target ? "#10b981" : "#ef4444" }}>{totalCO2.toFixed(1)}</div><div style={{ fontSize: 11, color: "#64748b" }}>t CO₂e</div></div>
+            <div style={{ textAlign: "center", padding: 10, background: "#f8fafc", borderRadius: 8 }}><div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Gebruikt van {baseYear}</div><div style={{ fontSize: 20, fontWeight: 700 }}>{pctOfBaseline.toFixed(1)}%</div><div style={{ fontSize: 11, color: "#64748b" }}>van basis</div></div>
           </div>
           {totalCO2 > 0 && totalCO2 < baseline && (
             <p style={{ margin: "10px 0 0", fontSize: 12, color: "#64748b", textAlign: "center" }}>
-              {actualReduction >= reductionPct
-                ? `Op koers! Momenteel ${actualReduction.toFixed(1)}% onder ${baseYear} — ${(actualReduction - reductionPct).toFixed(1)} pp boven het reductiedoel van ${reductionPct}%`
+              {actualReduction >= reductionPct ? `Op koers! Momenteel ${actualReduction.toFixed(1)}% onder ${baseYear} — ${(actualReduction - reductionPct).toFixed(1)} pp boven het reductiedoel van ${reductionPct}%`
                 : `Nog ${(reductionPct - actualReduction).toFixed(1)} procentpunt te gaan om het reductiedoel van ${reductionPct}% te halen`}
-            </p>
-          )}
+            </p>)}
         </div>
       </div>
 
@@ -375,7 +343,7 @@ export default function Home() {
                 <span style={{ fontSize: 11, color: "#94a3b8" }}>{getR(sIdx)}</span>
                 <button onClick={() => mv(i, -1)} disabled={i === 0} style={{ background: "none", border: "none", cursor: i === 0 ? "default" : "pointer", opacity: i === 0 ? 0.3 : 1, fontSize: 14 }}>↑</button>
                 <button onClick={() => mv(i, 1)} disabled={i === stops.length - 1} style={{ background: "none", border: "none", cursor: i === stops.length - 1 ? "default" : "pointer", opacity: i === stops.length - 1 ? 0.3 : 1, fontSize: 14 }}>↓</button>
-                <button onClick={() => rm(i)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 14 }}>✕</button>
+                <button onClick={() => rmStop(i)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 14 }}>✕</button>
               </div>
             ))}
           </div>
@@ -394,13 +362,9 @@ export default function Home() {
               <div style={{ fontSize: 11, fontWeight: 700, color: r.color, marginBottom: 6, textTransform: "uppercase", letterSpacing: 1 }}>{r.label}</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
                 {r.data.map((p, i) => {
-                  const gIdx = REGION_OFFSETS[r.key] + i;
+                  const gIdx = RO[r.key] + i;
                   const active = stops.includes(gIdx);
-                  return (
-                    <button key={`${r.key}-${i}`} onClick={() => toggle(gIdx)} style={{ padding: "4px 9px", borderRadius: 5, fontSize: 11, cursor: "pointer", border: active ? `2px solid ${r.color}` : "1px solid #cbd5e1", background: active ? `${r.color}15` : "#fff", color: active ? r.color : "#475569", fontWeight: active ? 700 : 400 }}>
-                      {p.city}{active ? ` (${stops.indexOf(gIdx) + 1})` : ""}
-                    </button>
-                  );
+                  return (<button key={`${r.key}-${i}`} onClick={() => toggle(gIdx)} style={{ padding: "4px 9px", borderRadius: 5, fontSize: 11, cursor: "pointer", border: active ? `2px solid ${r.color}` : "1px solid #cbd5e1", background: active ? `${r.color}15` : "#fff", color: active ? r.color : "#475569", fontWeight: active ? 700 : 400 }}>{p.city}{active ? ` (${stops.indexOf(gIdx) + 1})` : ""}</button>);
                 })}
               </div>
             </div>
@@ -413,18 +377,17 @@ export default function Home() {
             {route.legs.map((leg, i) => (
               <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", borderBottom: "1px solid #e2e8f0" }}>
                 <span>{leg.from} → {leg.to}</span>
-                <span style={{ color: "#64748b" }}>{leg.gc.toLocaleString()} km ({mode === "flight" ? (leg.gc >= HAUL_THRESHOLD ? "langeafstand" : "korteafstand") : "trein"}) · <strong>{(leg.co2 * 1000).toFixed(1)} kg</strong></span>
+                <span style={{ color: "#64748b" }}>{leg.gc.toLocaleString()} km ({mode === "flight" ? (leg.gc >= HAUL ? "langeafstand" : "korteafstand") : "trein"}) · <strong>{(leg.co2 * 1000).toFixed(1)} kg</strong></span>
               </div>
             ))}
-            <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0 0", fontWeight: 700 }}>
-              <span>Totaal</span>
-              <span>{Math.round(route.totalKm).toLocaleString()} km · {route.totalCO2.toFixed(3)} t CO₂e</span>
-            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0 0", fontWeight: 700 }}><span>Totaal</span><span>{Math.round(route.totalKm).toLocaleString()} km · {route.totalCO2.toFixed(3)} t CO₂e</span></div>
           </div>
         )}
 
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={add} style={{ padding: "10px 24px", background: "#154273", color: "#fff", border: "none", borderRadius: 8, fontWeight: 600, fontSize: 14, cursor: "pointer" }}>{editIdx !== null ? "Reis bijwerken" : "Reis toevoegen"}</button>
+          <button onClick={add} disabled={saving} style={{ padding: "10px 24px", background: saving ? "#94a3b8" : "#154273", color: "#fff", border: "none", borderRadius: 8, fontWeight: 600, fontSize: 14, cursor: saving ? "default" : "pointer" }}>
+            {saving ? "Opslaan..." : editIdx !== null ? "Reis bijwerken" : "Reis toevoegen"}
+          </button>
           {editIdx !== null && (<button onClick={() => { setEditIdx(null); setTraveler(""); setStartDate(""); setEndDate(""); setStops([]); }} style={{ padding: "10px 24px", background: "#e2e8f0", border: "none", borderRadius: 8, fontWeight: 600, fontSize: 14, cursor: "pointer" }}>Annuleren</button>)}
         </div>
       </div>
@@ -432,17 +395,25 @@ export default function Home() {
       {/* Reisoverzicht */}
       {trips.length > 0 && (
         <div style={st.card}>
-          <h2 style={{ margin: "0 0 12px", fontSize: 16, fontWeight: 700 }}>Reisoverzicht ({trips.length} {trips.length === 1 ? "reis" : "reizen"})</h2>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>Reisoverzicht ({trips.length} {trips.length === 1 ? "reis" : "reizen"})</h2>
+            <button onClick={() => {
+              const header = "Startdatum;Einddatum;Reiziger;Vervoer;Klasse;Route;Afstand (km);CO2e (ton)\n";
+              const rows = [...trips].sort((a, b) => a.startDate.localeCompare(b.startDate)).map(t =>
+                `${t.startDate};${t.endDate};${t.traveler};${t.mode === "flight" ? "Vlucht" : "Trein"};${t.mode === "train" ? "" : t.class};${t.route};${Math.round(t.km)};${t.co2.toFixed(4).replace(".", ",")}`
+              ).join("\n");
+              const summary = `\n\nSamenvatting\nTotaal reizen;${trips.length}\nTotaal km;${Math.round(trips.reduce((s,t) => s+t.km, 0))}\nTotaal CO2e (ton);${totalCO2.toFixed(4).replace(".", ",")}\nBasisjaar;${baseYear}\nBaseline (ton);${baseline}\nReductiedoel;${reductionPct}%\nDoel ${currentYear} (ton);${target.toFixed(1).replace(".", ",")}\nGebruikt van doel;${pctOfTarget.toFixed(1).replace(".", ",")}%`;
+              const blob = new Blob(["\uFEFF" + header + rows + summary], { type: "text/csv;charset=utf-8;" });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a"); a.href = url; a.download = `DAF_Emissie_Tracker_${currentYear}_export.csv`; a.click(); URL.revokeObjectURL(url);
+            }} style={{ padding: "8px 16px", background: "#154273", color: "#fff", border: "none", borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>Exporteer CSV</button>
+          </div>
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-              <thead>
-                <tr style={{ borderBottom: "2px solid #e2e8f0", textAlign: "left" }}>
-                  <th style={{ padding: "8px 6px" }}>Datum</th><th style={{ padding: "8px 6px" }}>Reiziger</th><th style={{ padding: "8px 6px" }}>Vervoer</th><th style={{ padding: "8px 6px" }}>Route</th><th style={{ padding: "8px 6px" }}>Klasse</th><th style={{ padding: "8px 6px", textAlign: "right" }}>km</th><th style={{ padding: "8px 6px", textAlign: "right" }}>CO₂e (t)</th><th style={{ padding: "8px 6px" }}></th>
-                </tr>
-              </thead>
+              <thead><tr style={{ borderBottom: "2px solid #e2e8f0", textAlign: "left" }}><th style={{ padding: "8px 6px" }}>Datum</th><th style={{ padding: "8px 6px" }}>Reiziger</th><th style={{ padding: "8px 6px" }}>Vervoer</th><th style={{ padding: "8px 6px" }}>Route</th><th style={{ padding: "8px 6px" }}>Klasse</th><th style={{ padding: "8px 6px", textAlign: "right" }}>km</th><th style={{ padding: "8px 6px", textAlign: "right" }}>CO₂e (t)</th><th style={{ padding: "8px 6px" }}></th></tr></thead>
               <tbody>
                 {[...trips].sort((a, b) => a.startDate.localeCompare(b.startDate)).map((t, i) => (
-                  <tr key={i} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                  <tr key={t.id || i} style={{ borderBottom: "1px solid #f1f5f9" }}>
                     <td style={{ padding: "8px 6px", fontSize: 12, whiteSpace: "nowrap" }}>{t.startDate}{t.endDate && t.endDate !== t.startDate ? <><br /><span style={{ color: "#64748b" }}>→ {t.endDate}</span></> : ""}</td>
                     <td style={{ padding: "8px 6px", fontWeight: 600 }}>{t.traveler}</td>
                     <td style={{ padding: "8px 6px" }}>{t.mode === "flight" ? "Vlucht" : "Trein"}</td>
